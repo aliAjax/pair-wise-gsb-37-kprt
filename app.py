@@ -417,6 +417,68 @@ class Database:
             self._audit(conn, actor, "sync.batch", "device", None, {k: result[k] for k in ("created", "updated", "duplicates")})
         return result
 
+    @staticmethod
+    def _same_id(value: Any, expected: int) -> bool:
+        try:
+            return int(value) == int(expected)
+        except (TypeError, ValueError):
+            return False
+
+    def split_sample(self, parent_id: int, actor: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """在已同步母样上分装子样：编号按母样续接，子样继承母样的航次和站位。"""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            parent = conn.execute("SELECT * FROM samples WHERE id=?", (parent_id,)).fetchone()
+            if not parent:
+                raise DomainError("母样不存在", 404)
+            if parent["confirmed"]:
+                raise DomainError("母样已确认锁定，不能再分装子样", 409)
+            station_id = payload.get("station_id") or payload.get("station_server_id")
+            if station_id is not None and not self._same_id(station_id, parent["station_id"]):
+                raise DomainError("子样必须继承母样站位，不能改挂其他站位")
+            voyage_id = payload.get("voyage_id") or payload.get("voyage_server_id")
+            if voyage_id is not None and not self._same_id(voyage_id, parent["voyage_id"]):
+                raise DomainError("子样必须继承母样航次，不能改挂其他航次")
+            try:
+                count = int(payload.get("count", 1))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("分样数量必须是整数") from exc
+            if not 1 <= count <= 100:
+                raise DomainError("分样数量需在 1 到 100 之间")
+            sample_type = str(payload.get("sample_type", parent["sample_type"])).strip()
+            storage = str(payload.get("storage_condition", parent["storage_condition"])).strip()
+            try:
+                depth = float(payload.get("depth_m", parent["depth_m"]))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("采样深度必须是数值") from exc
+            if not sample_type or not storage or depth < 0:
+                raise DomainError("样本类型、保存条件不能为空，深度不能为负")
+            owner = str(payload.get("owner", actor))
+            children: list[dict[str, Any]] = []
+            conflicts: list[dict[str, Any]] = []
+            for _ in range(count):
+                seq = int(conn.execute("SELECT COUNT(*) AS c FROM samples WHERE parent_sample_id=?", (parent["id"],)).fetchone()["c"]) + 1
+                code = f"{parent['sample_code']}-{seq}"
+                existing = conn.execute("SELECT * FROM samples WHERE sample_code=?", (code,)).fetchone()
+                if existing:
+                    suffix = hashlib.sha256(f"split:{parent['id']}:{code}".encode()).hexdigest()[:8]
+                    dup_code = f"{code}-DUP-{suffix}"
+                    conflicts.append(self._conflict(
+                        conn, "sample", "shore-split", f"split-{parent['id']}-{seq}",
+                        f"子样编号 {code} 已被占用，已分配 {dup_code}",
+                        {"parent_id": parent["id"], "sample_code": code}, int(existing["id"])))
+                    code = dup_code
+                cur = conn.execute(
+                    """INSERT INTO samples(voyage_id,station_id,parent_sample_id,sample_code,sample_type,depth_m,storage_condition,owner,revision,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (parent["voyage_id"], parent["station_id"], parent["id"], code, sample_type, depth, storage, owner, 1, utcnow()),
+                )
+                self._audit(conn, actor, "sample.split", "sample", cur.lastrowid,
+                            {"parent_id": parent["id"], "sample_code": code})
+                children.append(dict(conn.execute("SELECT * FROM samples WHERE id=?", (cur.lastrowid,)).fetchone()))
+            return {"parent_id": parent["id"], "parent_code": parent["sample_code"],
+                    "created": len(children), "children": children, "conflicts": conflicts}
+
     def confirm(self, entity_type: str, entity_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
         if role != "lead":
             raise DomainError("只有航次负责人可以确认记录", 403)
@@ -536,6 +598,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in parsed.path.split("/") if p]
             if len(parts) == 4 and parts[:2] == ["api", "confirm"]:
                 return self._send(self.db.confirm(parts[2], int(parts[3]), actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "samples"] and parts[3] == "split":
+                return self._send(self.db.split_sample(int(parts[2]), actor, body), 201)
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))

@@ -1,13 +1,32 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>海洋采样同步</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1050px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>海洋科考采样与岸端同步</h1><p>将离线设备的一批站位、样本、交接和仪器文件提交到服务。本地 UUID 重复提交会幂等处理，冲突会进入隔离清单。</p>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1050px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}.locked{color:#b04a2f;font-weight:600}</style></head>
+<body><h1>海洋科考采样与岸端同步</h1><p>将离线设备的一批站位、样本、交接和仪器文件提交到服务。本地 UUID 重复提交会幂等处理，冲突会进入隔离清单。母样可分装成子样送不同实验室，编号按母样续接（如 W-001 → W-001-1）。</p>
 <div class="card"><h2>身份</h2><input id="user" value="member-a"><select id="role"><option>member</option><option>lead</option><option>editor</option></select><button onclick="refresh()">刷新全部</button> <label>航次 ID <input id="voyage" type="number" value="1"></label></div>
 <div class="card"><h2>离线批次 JSON</h2><textarea id="batch" rows="16">{"device_id":"tablet-A","records":[{"type":"station","local_uuid":"st-001","revision":1,"data":{"voyage_id":1,"station_code":"S-01","latitude":30.1,"longitude":122.0,"sampled_at":"2026-09-05T08:30:00+08:00","owner":"member-a"}},{"type":"sample","local_uuid":"sample-001","revision":1,"data":{"station_id":1,"sample_code":"W-001","sample_type":"water","depth_m":5,"storage_condition":"4C","owner":"member-a"}}]}</textarea><button onclick="syncBatch()">同步批次</button><pre id="syncResult">等待同步…</pre></div>
+<div class="card"><h2>分样（母样 → 子样）</h2>
+<p><small>子样继承母样的航次和站位，改挂别的站位会被拒绝；编号被占用时自动分配 -DUP 后缀并进入隔离清单，不覆盖原记录。母样被负责人确认锁定后不能再分样，已分出的子样仍可单独交接。</small></p>
+<label>母样 ID <input id="parentId" type="number" value="1" min="1"></label>
+<label>分装份数 <input id="splitCount" type="number" value="1" min="1" max="100"></label>
+<button onclick="splitSample()">生成子样</button>
+<label>确认锁定 <select id="confirmType"><option value="sample">样本</option><option value="station">站位</option></select>
+ID <input id="confirmId" type="number" value="1" min="1"></label>
+<button onclick="confirmRecord()">负责人确认</button>
+<pre id="splitResult">等待操作…</pre></div>
+<div class="card"><h2>样本与分样关系</h2><pre id="sampleTree">等待刷新…</pre></div>
 <div class="card"><h2>数据与冲突</h2><pre id="data">等待刷新…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
 async function syncBatch(){try{syncResult.textContent=JSON.stringify(await call('/api/sync',{method:'POST',headers:auth(),body:batch.value}),null,2);refresh()}catch(e){syncResult.textContent=e.message}}
-async function refresh(){try{const [stations,samples,conflicts,files,custody]=await Promise.all(['/api/stations','/api/samples','/api/conflicts','/api/instrument-files','/api/custody'].map(u=>call(u)));data.textContent=JSON.stringify({stations,samples,conflicts,files,custody},null,2)}catch(e){data.textContent=e.message}}
+async function splitSample(){try{splitResult.textContent=JSON.stringify(await call(`/api/samples/${parentId.value}/split`,{method:'POST',headers:auth(),body:JSON.stringify({count:+splitCount.value||1})}),null,2);refresh()}catch(e){splitResult.textContent=e.message}}
+async function confirmRecord(){try{splitResult.textContent=JSON.stringify(await call(`/api/confirm/${confirmType.value}/${confirmId.value}`,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){splitResult.textContent=e.message}}
+function renderTree(samples){
+  const kids={};samples.forEach(s=>{const k=s.parent_sample_id||0;(kids[k]=kids[k]||[]).push(s)});
+  const lines=[];const walk=(pid,prefix)=>{(kids[pid]||[]).forEach(s=>{
+    lines.push(`${prefix}#${s.id} ${s.sample_code}  类型:${s.sample_type}  航次:${s.voyage_id}  站位:${s.station_id}  状态:${s.confirmed?'已确认锁定':'未确认'}  记录人:${s.owner}`);
+    walk(s.id,prefix+'    └─ ')})};
+  walk(0,'');return lines.join('\n')||'(暂无样本)';
+}
+async function refresh(){try{const [stations,samples,conflicts,files,custody]=await Promise.all(['/api/stations','/api/samples','/api/conflicts','/api/instrument-files','/api/custody'].map(u=>call(u)));sampleTree.textContent=renderTree(samples.items);data.textContent=JSON.stringify({stations,samples,conflicts,files,custody},null,2)}catch(e){data.textContent=e.message}}
 </script></body></html>

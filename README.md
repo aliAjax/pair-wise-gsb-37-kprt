@@ -37,6 +37,8 @@ python app.py --port 8008
 - `local_uuid + device_id` 是幂等键；相同内容重复上传直接返回已有记录。
 - `revision` 必须递增。旧修订或同修订不同内容会进入冲突表，不会覆盖新数据。
 - 站位编号在航次内唯一，样本编号全局唯一；检测到另一设备使用相同编号时分配 `-DUP-xxxx` 后缀并把冲突写入隔离表。
+- 母样可分装成子样送不同实验室：子样编号按母样续接（`W-001` → `W-001-1`、`W-001-2`…），继承母样的航次和站位，改挂别的站位或航次会被拒绝；子样编号被占用时同样分配 `-DUP-xxxxxxxx` 后缀并进入隔离清单，不覆盖原记录。
+- 母样被 `lead` 确认锁定后不能再新增子样；已分出的子样不受影响，仍可单独交接保管。
 - 记录人员只能修改自己创建的站位/样本，`lead` 可以处理全部记录。
 - `lead` 确认样本或站位后，该记录变为只读；发现错误必须通过新记录处理，不能用同步覆盖历史。
 - 保管交接是追加式事件；仪器文件以 SHA-256 去重，原始内容相同但来自不同设备时只保存一次元数据。
@@ -46,6 +48,7 @@ python app.py --port 8008
 
 - `POST /api/voyages`：创建航次。
 - `POST /api/sync`：批量同步离线记录。
+- `POST /api/samples/{id}/split`：在已同步母样上分装子样，body 可带 `count`（默认 1）及可选的 `sample_type`、`depth_m`、`storage_condition` 覆盖；航次和站位强制继承母样。
 - `POST /api/confirm/station/{id}` 或 `/api/confirm/sample/{id}`：负责人确认锁定。
 - `GET /api/stations`、`/api/samples`、`/api/custody`、`/api/instrument-files`：查询记录。
 - `GET /api/conflicts`：查看编号冲突、旧修订和权限冲突。
@@ -57,4 +60,4 @@ python app.py --port 8008
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖完整离线同步、幂等重复、编号冲突、成员越权、旧修订、确认锁定、追加式交接和文件哈希去重。
+测试覆盖完整离线同步、幂等重复、编号冲突、成员越权、旧修订、确认锁定、追加式交接、文件哈希去重，以及母样分样（编号续接、撞号隔离、锁定禁分、子样单独交接、站位继承校验）。
