@@ -1,13 +1,68 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>海洋采样同步</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1050px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1050px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}.locked{color:#b00;font-weight:600}.dup{color:#a60}.tree ul{margin:2px 0 2px 18px;padding-left:14px;border-left:2px solid #cdd8e2}.tree li{list-style:none;margin:3px 0}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d9e1e8;padding:5px 8px;text-align:left;font-size:13px;vertical-align:top}</style></head>
 <body><h1>海洋科考采样与岸端同步</h1><p>将离线设备的一批站位、样本、交接和仪器文件提交到服务。本地 UUID 重复提交会幂等处理，冲突会进入隔离清单。</p>
 <div class="card"><h2>身份</h2><input id="user" value="member-a"><select id="role"><option>member</option><option>lead</option><option>editor</option></select><button onclick="refresh()">刷新全部</button> <label>航次 ID <input id="voyage" type="number" value="1"></label></div>
 <div class="card"><h2>离线批次 JSON</h2><textarea id="batch" rows="16">{"device_id":"tablet-A","records":[{"type":"station","local_uuid":"st-001","revision":1,"data":{"voyage_id":1,"station_code":"S-01","latitude":30.1,"longitude":122.0,"sampled_at":"2026-09-05T08:30:00+08:00","owner":"member-a"}},{"type":"sample","local_uuid":"sample-001","revision":1,"data":{"station_id":1,"sample_code":"W-001","sample_type":"water","depth_m":5,"storage_condition":"4C","owner":"member-a"}}]}</textarea><button onclick="syncBatch()">同步批次</button><pre id="syncResult">等待同步…</pre></div>
-<div class="card"><h2>数据与冲突</h2><pre id="data">等待刷新…</pre></div>
+<div class="card"><h2>在母样上分出子样</h2><p><small>在已同步的母样上生成子样，编号按母样续接（W-001 → W-001-1）。子样继承母样航次与站位；母样确认锁定后不能再分；编号撞号会分配 -DUP 后缀并进隔离清单，不覆盖原记录。</small></p>
+<label>母样 ID <input id="spParent" type="number" placeholder="如 1"></label>
+<label>保存条件 <input id="spStorage" placeholder="留空继承母样，如 4C"></label>
+<label>深度 m <input id="spDepth" type="number" step="0.1" placeholder="留空继承母样"></label>
+<label>类型 <input id="spType" placeholder="留空继承母样"></label>
+<label>接收人 <input id="spOwner" placeholder="留空继承母样"></label>
+<button onclick="splitSample()">分出子样</button><pre id="splitResult">未分样</pre></div>
+<div class="card"><h2>子样单独交接</h2><p><small>母样锁定不影响已分出子样的单独交接。</small></p>
+<label>子样 ID <input id="cuSample" type="number" placeholder="如 2"></label>
+<label>事件 <select id="cuType"><option value="handover">handover</option><option value="receive">receive</option><option value="ship">ship</option></select></label>
+<label>交出方 <input id="cuFrom" value="member-a"></label>
+<label>接收方 <input id="cuTo" value="shore-lab"></label>
+<label>时间 <input id="cuAt" value="2026-09-26T09:00:00+08:00"></label>
+<button onclick="handover()">登记交接</button><pre id="custodyResult">未登记</pre></div>
+<div class="card"><h2>分样关系</h2><div class="tree" id="tree">等待刷新…</div></div>
+<div class="card"><h2>隔离清单</h2><div id="conflicts">等待刷新…</div></div>
+<div class="card"><h2>原始数据</h2><pre id="data">等待刷新…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
 async function syncBatch(){try{syncResult.textContent=JSON.stringify(await call('/api/sync',{method:'POST',headers:auth(),body:batch.value}),null,2);refresh()}catch(e){syncResult.textContent=e.message}}
-async function refresh(){try{const [stations,samples,conflicts,files,custody]=await Promise.all(['/api/stations','/api/samples','/api/conflicts','/api/instrument-files','/api/custody'].map(u=>call(u)));data.textContent=JSON.stringify({stations,samples,conflicts,files,custody},null,2)}catch(e){data.textContent=e.message}}
+async function splitSample(){
+  const body={};
+  if(spStorage.value.trim())body.storage_condition=spStorage.value.trim();
+  if(spDepth.value.trim())body.depth_m=Number(spDepth.value);
+  if(spType.value.trim())body.sample_type=spType.value.trim();
+  if(spOwner.value.trim())body.owner=spOwner.value.trim();
+  try{
+    const child=await call('/api/samples/'+Number(spParent.value)+'/split',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+    splitResult.textContent=JSON.stringify(child,null,2);refresh();
+  }catch(e){splitResult.textContent=e.message}
+}
+async function handover(){
+  const rec={device_id:user.value||'web',records:[{type:'custody',local_uuid:'custody-'+crypto.randomUUID(),revision:1,data:{
+    sample_id:Number(cuSample.value),event_type:cuType.value,from_party:cuFrom.value.trim(),to_party:cuTo.value.trim(),occurred_at:cuAt.value}}]};
+  try{custodyResult.textContent=JSON.stringify(await call('/api/sync',{method:'POST',headers:auth(),body:JSON.stringify(rec)}),null,2);refresh()}
+  catch(e){custodyResult.textContent=e.message}
+}
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function sampleLine(s,stations){
+  const st=(stations.find(x=>x.id===s.station_id)||{}).station_code||('#'+s.station_id);
+  const dup=s.sample_code.includes('-DUP')?' <span class="dup">[隔离重号]</span>':'';
+  const lock=s.confirmed?' <span class="locked">[已锁定]</span>':'';
+  return `<b>${esc(s.sample_code)}</b>${dup}${lock} <small>${esc(s.sample_type)} · 站位 ${esc(st)} · 负责人 ${esc(s.owner)} · id=${s.id}</small>`;
+}
+function renderTree(samples,stations){
+  const byParent={};
+  for(const s of samples)(byParent[s.parent_sample_id??'root']??=[]).push(s);
+  const walk=list=>'<ul>'+list.sort((a,b)=>a.id-b.id).map(s=>'<li>'+sampleLine(s,stations)+walk(byParent[s.id]||[])+'</li>').join('')+'</ul>';
+  const roots=byParent['root']||[];
+  tree.innerHTML=roots.length?walk(roots):'<small>暂无样本，先同步一条母样。</small>';
+}
+function renderConflicts(items){
+  if(!items.length){conflicts.innerHTML='<small>无冲突。</small>';return}
+  conflicts.innerHTML='<table><tr><th>id</th><th>实体</th><th>本地 UUID</th><th>原因</th></tr>'+
+    items.map(c=>`<tr><td>${c.id}</td><td>${esc(c.entity_type)}</td><td>${esc(c.local_uuid)}</td><td>${esc(c.reason)}</td></tr>`).join('')+'</table>';
+}
+async function refresh(){try{const [stations,samples,conflicts,files,custody]=await Promise.all(['/api/stations','/api/samples','/api/conflicts','/api/instrument-files','/api/custody'].map(u=>call(u)));
+  renderTree(samples.items,stations.items);renderConflicts(conflicts.items);
+  data.textContent=JSON.stringify({stations,samples,conflicts,files,custody},null,2)}catch(e){tree.textContent=conflicts.textContent=data.textContent=e.message}}
+refresh();
 </script></body></html>

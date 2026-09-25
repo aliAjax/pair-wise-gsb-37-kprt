@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -256,7 +257,7 @@ class Database:
             raise DomainError("母样不存在", 404)
         return row
 
-    def _validate_sample(self, record: dict[str, Any]) -> tuple[str, str, float, str]:
+    def _validate_sample(self, record: dict[str, Any], require_code: bool = True) -> tuple[str, str, float, str]:
         code = str(record.get("sample_code", "")).strip()
         sample_type = str(record.get("sample_type", "")).strip()
         storage = str(record.get("storage_condition", "")).strip()
@@ -264,9 +265,22 @@ class Database:
             depth = float(record.get("depth_m", 0))
         except (TypeError, ValueError) as exc:
             raise DomainError("采样深度必须是数值") from exc
-        if not code or not sample_type or not storage or depth < 0:
+        if (require_code and not code) or not sample_type or not storage or depth < 0:
             raise DomainError("样本编号、类型、保存条件不能为空，深度不能为负")
         return code, sample_type, depth, storage
+
+    @staticmethod
+    def _next_child_code(parent_code: str, existing: list[str]) -> str:
+        """子样编号按母样续接：W-001 已分出 W-001-1、W-001-2 时返回 W-001-3。"""
+        used: set[int] = set()
+        for code in existing:
+            tail = code[len(parent_code) + 1:] if code.startswith(parent_code + "-") else ""
+            if tail.isdigit():
+                used.add(int(tail))
+        seq = 1
+        while seq in used:
+            seq += 1
+        return f"{parent_code}-{seq}"
 
     def _sync_sample(self, conn: sqlite3.Connection, actor: str, role: str, device_id: str,
                      local_uuid: str, revision: int, record: dict[str, Any], result: dict[str, Any]) -> None:
@@ -307,7 +321,21 @@ class Database:
             return
         station = self._station(conn, record)
         parent = self._parent_sample(conn, record)
-        code, sample_type, depth, storage = self._validate_sample(record)
+        if parent is not None:
+            # 只有母样（顶层样本）可以再分样；子样必须挂在母样的航次与站位下。
+            if parent["parent_sample_id"] is not None:
+                raise DomainError("子样不能再作为母样分样", 400)
+            if parent["confirmed"]:
+                raise DomainError("母样已被负责人确认锁定，不能再新增子样", 409)
+            if station["id"] != parent["station_id"] or station["voyage_id"] != parent["voyage_id"]:
+                raise DomainError("子样必须继承母样的航次和站位，不能改挂别的站位", 400)
+        require_code = parent is None
+        code, sample_type, depth, storage = self._validate_sample(record, require_code=require_code)
+        if not code:
+            siblings = [r["sample_code"] for r in conn.execute(
+                "SELECT sample_code FROM samples WHERE parent_sample_id=?", (parent["id"],)
+            ).fetchall()]
+            code = self._next_child_code(parent["sample_code"], siblings)
         existing = conn.execute("SELECT * FROM samples WHERE sample_code=?", (code,)).fetchone()
         if existing:
             code = f"{code}-DUP-{local_uuid[:8]}"
@@ -433,6 +461,72 @@ class Database:
             self._audit(conn, actor, f"{entity_type}.confirmed", entity_type, entity_id, {})
             return dict(conn.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,)).fetchone())
 
+    def split_sample(self, parent_id: int, actor: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """在已同步母样上生成子样。编号按母样续接；撞号时分配 -DUP 后缀并进隔离清单。"""
+        with self.connect() as conn:
+            parent = conn.execute("SELECT * FROM samples WHERE id=?", (parent_id,)).fetchone()
+            if not parent:
+                raise DomainError("母样不存在", 404)
+            if parent["parent_sample_id"] is not None:
+                raise DomainError("只能在母样上分样，子样不能再分出子样", 400)
+            if parent["confirmed"]:
+                raise DomainError("母样已被负责人确认锁定，不能再新增子样", 409)
+
+            station_id = payload.get("station_id", parent["station_id"])
+            voyage_id = payload.get("voyage_id", parent["voyage_id"])
+            try:
+                station_id, voyage_id = int(station_id), int(voyage_id)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("航次、站位必须是整数") from exc
+            # 子样继承母样的航次和站位，改挂别的站位会被拒绝。
+            if station_id != parent["station_id"] or voyage_id != parent["voyage_id"]:
+                raise DomainError("子样必须继承母样的航次和站位，不能改挂别的站位", 400)
+
+            sample_type = str(payload.get("sample_type") or parent["sample_type"]).strip()
+            storage = str(payload.get("storage_condition") or parent["storage_condition"]).strip()
+            try:
+                depth = float(payload.get("depth_m", parent["depth_m"]))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("采样深度必须是数值") from exc
+            if not sample_type or not storage or depth < 0:
+                raise DomainError("样本类型、保存条件不能为空，深度不能为负")
+            owner = str(payload.get("owner") or parent["owner"] or actor).strip()
+
+            siblings = [r["sample_code"] for r in conn.execute(
+                "SELECT sample_code FROM samples WHERE parent_sample_id=?", (parent["id"],)
+            ).fetchall()]
+            requested = self._next_child_code(parent["sample_code"], siblings)
+            code, conflict = requested, None
+            clash = conn.execute("SELECT * FROM samples WHERE sample_code=?", (code,)).fetchone()
+            if clash:
+                # 编号已被占用：不覆盖原记录，分配 -DUP 后缀并写入隔离清单。
+                local_uuid = f"split-{uuid.uuid4().hex}"
+                code = f"{requested}-DUP-{local_uuid[-8:]}"
+                dup_payload = {
+                    "parent_sample_id": parent["id"], "sample_code": requested,
+                    "sample_type": sample_type, "depth_m": depth,
+                    "storage_condition": storage, "owner": owner,
+                }
+                conflict = self._conflict(
+                    conn, "sample", "shore", local_uuid,
+                    f"样本编号 {requested} 已存在，已分配 {code}", dup_payload, int(clash["id"]),
+                )
+
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO samples(voyage_id,station_id,parent_sample_id,sample_code,sample_type,depth_m,storage_condition,owner,revision,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,1,?)""",
+                (voyage_id, station_id, parent["id"], code, sample_type, depth, storage, owner, now),
+            )
+            child_id = int(cur.lastrowid)
+            self._audit(conn, actor, "sample.split", "sample", child_id,
+                        {"parent_sample_id": parent["id"], "sample_code": code, "duplicated": conflict is not None})
+            child = dict(conn.execute("SELECT * FROM samples WHERE id=?", (child_id,)).fetchone())
+            if conflict:
+                child["requested_code"] = requested
+                child["conflict"] = conflict
+            return child
+
     def list_voyages(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM voyages ORDER BY id").fetchall()]
@@ -534,6 +628,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/sync":
                 return self._send(self.db.sync(actor, role, body))
             parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "samples"] and parts[3] == "split":
+                return self._send(self.db.split_sample(int(parts[2]), actor, body), 201)
             if len(parts) == 4 and parts[:2] == ["api", "confirm"]:
                 return self._send(self.db.confirm(parts[2], int(parts[3]), actor, role))
             raise DomainError("接口不存在", 404)
